@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 from torch.utils.data import Dataset
 import numpy as np
 import pandas as pd
@@ -8,15 +8,48 @@ from collections import defaultdict
 from enum import Enum
 from kinematics_sampling_mode import KinematicsSamplingMode
 from labels_format import LabelsFormat
+from users import Users
+from trials import Trials
+from unlabeled_data_policy import UnlabeledDataPolicy
+from data_scalers.scalers import BaseScaler
+import torch
 
 class KinematicsDataset(Dataset):
-    def __init__(self, dir: str, mode: KinematicsSamplingMode, labels_format: LabelsFormat = LabelsFormat.RAW, transform=None):
+    def __init__(self, 
+                 dir: str, 
+                 mode: KinematicsSamplingMode = KinematicsSamplingMode.SEQUENCE, 
+                 labels_format: LabelsFormat = LabelsFormat.RAW, 
+                 unlabeled_policy: UnlabeledDataPolicy = UnlabeledDataPolicy.KEEP,
+                 users_set: Tuple[Users] = (Users.B, Users.C, Users.D, Users.E, Users.F, Users.G, Users.H, Users.I),
+                 trials_set: Tuple[Trials] = (Trials.T1, Trials.T2, Trials.T3, Trials.T4, Trials.T5),
+                 transform=None):
         """
+        Initializes the JIGSAWS Kinematics Dataset.
+
+        This class handles loading, processing, and structuring the JIGSAWS dataset
+        for use with PyTorch's DataLoader.
+
         Args:
-            dir (str): Directory containing data.
-            mode (KinematicsSamplingMode): Sampling mode.
-            labels_format (LabelsFormat): The desired format for the labels.
-            transform (callable, optional): Optional transform to be applied on a sample.
+            dir (str): The root directory of the JIGSAWS dataset subset (e.g., "dataset/Suturing/").
+            mode (KinematicsSamplingMode, optional): Defines how data is structured. 
+                Defaults to KinematicsSamplingMode.SEQUENCE.
+                - KinematicsSamplingMode.SEQUENCE: Each item in the dataset is a full trial sequence.
+                - KinematicsSamplingMode.SAMPLE: The dataset is flattened into individual samples across all trials.
+            labels_format (LabelsFormat, optional): Defines the format of the output labels. 
+                Defaults to LabelsFormat.RAW.
+                - LabelsFormat.RAW: Labels are kept as strings (e.g., 'G1', 'G5').
+                - LabelsFormat.INTEGER: Labels are mapped to a dense, 0-indexed integer range.
+                - LabelsFormat.ONE_HOT: Labels are one-hot encoded based on the unique gestures found.
+            unlabeled_policy (UnlabeledDataPolicy, optional): Defines how to handle unlabeled samples. 
+                Defaults to UnlabeledDataPolicy.KEEP.
+                - UnlabeledDataPolicy.KEEP: Unlabeled samples are kept and assigned the default label 'G0'.
+                - UnlabeledDataPolicy.IGNORE: Unlabeled samples are filtered out and discarded.
+            users_set (Tuple[Users], optional): A tuple of `Users` enum members to include. 
+                Defaults to all users in the dataset.
+            trials_set (Tuple[Trials], optional): A tuple of `Trials` enum members to include. 
+                Defaults to all trials for the selected users.
+            transform (callable, optional): Optional transform to be applied on a sample. 
+                Applied in __getitem__.
         """
 
         dir_kinematics = os.path.join(dir, "kinematics", "AllGestures")
@@ -55,6 +88,9 @@ class KinematicsDataset(Dataset):
                 print(f"G{original_gest} -> {mapped_int}")
             print("-" * 30) # Separator for clarity
         
+
+        # Loading all the data into self.kinematics_data and self.labels_data,
+        # first as a dictionary of [user][trial] = np.array
         for kinematics_filename in os.listdir(dir_kinematics):
             label_filepath = os.path.join(dir_labels, kinematics_filename)
 
@@ -67,11 +103,10 @@ class KinematicsDataset(Dataset):
                     kinematics_filepath = os.path.join(dir_kinematics, kinematics_filename)
                     
                     # Read kinematics data
-                    kinematics_df = pd.read_csv(kinematics_filepath, sep=r'\s+', header=None)
-                    self.kinematics_data[user][trial] = kinematics_df.values
+                    kinematics_trial_data = pd.read_csv(kinematics_filepath, sep=r'\s+', header=None).values
 
                     # Read and process labels data
-                    num_samples = self.kinematics_data[user][trial].shape[0]
+                    num_samples = kinematics_trial_data.shape[0]
                     labels = np.full(num_samples, 'G0', dtype='<U2') # Default label 'G0'
 
                     labels_df = pd.read_csv(label_filepath, sep=r'\s+', header=None)
@@ -79,6 +114,14 @@ class KinematicsDataset(Dataset):
                         start, end, label = int(row[0]), int(row[1]), row[2]
                         labels[start-1:end] = label # Files are 1-indexed, numpy is 0-indexed
                     
+                    # Handle unlabeled data policy
+                    if unlabeled_policy == UnlabeledDataPolicy.IGNORE:
+                        labeled_indices = np.where(labels != 'G0')[0]
+                        kinematics_trial_data = kinematics_trial_data[labeled_indices]
+                        labels = labels[labeled_indices]
+
+                    self.kinematics_data[user][trial] = kinematics_trial_data
+
                     if labels_format == LabelsFormat.INTEGER:
                         # Remove 'G', convert to int, and apply mapping
                         labels = np.array([self.gesture_map[int(l[1:])] for l in labels])
@@ -92,84 +135,120 @@ class KinematicsDataset(Dataset):
         
 
 
+        ### Load only the specified users and trials into self.data and self.labels ###
 
+        self.data = []
+        self.labels = []
+        
+        # Convert enums to their primitive values for key lookup
+        user_values = [u.value for u in users_set] if users_set else []
+        trial_values = [t.value for t in trials_set] if trials_set else []
 
+        # Use all users/trials if sets are not provided
+        if not user_values:
+            user_values = self.kinematics_data.keys()
+        if not trial_values:
+            # Flatten all trial numbers from all users into a single set
+            all_trials = set()
+            for user in user_values:
+                all_trials.update(self.kinematics_data.get(user, {}).keys())
+            trial_values = list(all_trials)
 
+        for user in sorted(list(user_values)):
+            if user in self.kinematics_data:
+                for trial in sorted(list(trial_values)):
+                    if trial in self.kinematics_data[user]:
+                        kin_trial_data = self.kinematics_data[user][trial]
+                        label_trial_data = self.labels_data[user][trial]
+                        
+                        if mode == KinematicsSamplingMode.SEQUENCE:
+                            self.data.append(kin_trial_data)
+                            self.labels.append(label_trial_data)
+                        elif mode == KinematicsSamplingMode.SAMPLE:
+                            self.data.extend(kin_trial_data)
+                            self.labels.extend(label_trial_data)
+        
+        # Convert to numpy arrays for efficiency, especially for SAMPLE mode
+        if mode == KinematicsSamplingMode.SAMPLE:
+            self.data = np.array(self.data)
+            self.labels = np.array(self.labels)
+
+        self.transform = transform
+        self.scaler = None
+        self.mode = mode
+
+    def get_all_transformed_data(self):
+        """
+        Applies the transform to the entire dataset and returns the result.
+        This is useful for fitting a scaler on the training data.
+        """
+        if not self.transform:
+            raise RuntimeError("A transform must be provided to get transformed data.")
+
+        all_transformed_data = []
+        if self.mode == KinematicsSamplingMode.SEQUENCE:
+            for seq in self.data:
+                transformed_seq = self.transform(torch.from_numpy(seq).float())
+                all_transformed_data.append(transformed_seq)
+            return torch.cat(all_transformed_data, dim=0)
+        elif self.mode == KinematicsSamplingMode.SAMPLE:
+            return self.transform(torch.from_numpy(self.data).float())
+
+    def fit_scaler(self, scaler: "BaseScaler"):
+        """
+        Fits the given scaler on the dataset's transformed data and assigns it.
+
+        Args:
+            scaler (BaseScaler): An instance of a scaler to be fitted.
+        
+        Returns:
+            BaseScaler: The fitted scaler.
+        """
+        if not self.transform:
+            raise RuntimeError("A transform must be provided to fit a scaler.")
+
+        print("Fitting scaler on the dataset's data...")
+        data_to_fit = self.get_all_transformed_data()
+        scaler.fit(data_to_fit)
+        self.scaler = scaler
+        print("Scaler fitted and assigned to the dataset.")
+        return scaler
+
+    def set_scaler(self, scaler: "BaseScaler"):
+        """
+        Assigns a pre-fitted scaler to the dataset.
+
+        Args:
+            scaler (BaseScaler): A pre-fitted scaler instance.
+        """
+        self.scaler = scaler
+        print("Pre-fitted scaler assigned to the dataset.")
 
     def __len__(self):
-        # TODO
-        pass
+        return len(self.data)
 
     def __getitem__(self, idx):
-       # TODO
-       pass
+        # Get the raw data sample
+        data_sample = self.data[idx]
 
-if __name__ == '__main__':
-    # Example usage and testing
-    input_dir = "dataset/Suturing/"
+        # Convert to tensor for transformation
+        # The transform function expects a tensor
+        data_tensor = torch.from_numpy(data_sample).float()
 
-    print("--- Testing with LabelsFormat.RAW ---")
-    try:
-        raw_dataset = KinematicsDataset(
-            dir=input_dir,
-            mode=KinematicsSamplingMode.SEQUENCE, 
-            labels_format=LabelsFormat.RAW
-        )
-        # Test accessing a sample trial
-        sample_user = 'B'
-        sample_trial = 1
-        if sample_user in raw_dataset.kinematics_data and sample_trial in raw_dataset.kinematics_data[sample_user]:
-            kinematics_sample = raw_dataset.kinematics_data[sample_user][sample_trial]
-            labels_sample = raw_dataset.labels_data[sample_user][sample_trial]
-            print(f"User '{sample_user}', Trial {sample_trial}:")
-            print(f"  Kinematics data shape: {kinematics_sample.shape}")
-            print(f"  First row of kinematics data: {kinematics_sample[0]}")
-            print(f"  Labels data shape: {labels_sample.shape}")
-            print(f"  Sample labels (first 10): {labels_sample[:10]}")
+        # Apply the transformation if it exists
+        if self.transform:
+            transformed_data = self.transform(data_tensor)
         else:
-            print(f"Sample trial not found for User '{sample_user}', Trial {sample_trial}.")
-            print("Available users:", list(raw_dataset.kinematics_data.keys()))
+            transformed_data = data_tensor
 
-    except FileNotFoundError:
-        print(f"Error: The directory '{input_dir}' was not found.")
-        print("Please ensure the dataset is correctly placed.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        # Apply the scaler if it exists
+        if self.scaler:
+            # The scaler expects a tensor, which transformed_data already is
+            scaled_data = self.scaler.transform(transformed_data)
+        else:
+            scaled_data = transformed_data
 
-    print("\n" + "="*50 + "\n")
+        # Pair with the corresponding label
+        sample = (scaled_data, self.labels[idx])
 
-    print("--- Testing with LabelsFormat.INTEGER ---")
-    try:
-        int_dataset = KinematicsDataset(
-            dir=input_dir,
-            mode=KinematicsSamplingMode.SEQUENCE,
-            labels_format=LabelsFormat.INTEGER
-        )
-        if sample_user in int_dataset.kinematics_data and sample_trial in int_dataset.kinematics_data[sample_user]:
-            labels_sample = int_dataset.labels_data[sample_user][sample_trial]
-            print(f"User '{sample_user}', Trial {sample_trial}:")
-            print(f"  Sample labels (first 10): {labels_sample[:10]}")
-            print(f"  Unique integer labels in trial: {np.unique(labels_sample)}")
-    except FileNotFoundError:
-        print(f"Error: The directory '{input_dir}' was not found.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-    print("\n" + "="*50 + "\n")
-
-    print("--- Testing with LabelsFormat.ONE_HOT ---")
-    try:
-        one_hot_dataset = KinematicsDataset(
-            dir=input_dir,
-            mode=KinematicsSamplingMode.SEQUENCE,
-            labels_format=LabelsFormat.ONE_HOT
-        )
-        if sample_user in one_hot_dataset.kinematics_data and sample_trial in one_hot_dataset.kinematics_data[sample_user]:
-            labels_sample = one_hot_dataset.labels_data[sample_user][sample_trial]
-            print(f"User '{sample_user}', Trial {sample_trial}:")
-            print(f"  Labels data shape: {labels_sample.shape}")
-            print(f"  Sample one-hot label (first one): {labels_sample[0]}")
-    except FileNotFoundError:
-        print(f"Error: The directory '{input_dir}' was not found.")
-    except Exception as e:
-        print(f"An error occurred: {e}")
+        return sample
