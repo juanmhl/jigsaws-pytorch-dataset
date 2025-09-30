@@ -1,1 +1,1 @@
-from scalers import StandardScaler, MinMaxScaler
+from .scalers import StandardScaler, MinMaxScaler

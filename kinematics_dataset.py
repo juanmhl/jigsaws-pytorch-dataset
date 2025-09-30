@@ -9,6 +9,7 @@ from enum import Enum
 from options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
 from data_scalers.scalers import BaseScaler
 import torch
+from tqdm import tqdm
 
 class KinematicsDataset(Dataset):
     def __init__(self, 
@@ -60,7 +61,12 @@ class KinematicsDataset(Dataset):
         self.gesture_map = None
         num_classes = 0
         if labels_format in [LabelsFormat.INTEGER, LabelsFormat.ONE_HOT]:
-            unique_gesture_nums = {0}  # Start with 0 for G0
+            # If unlabeled data is ignored, G0 is not a valid label
+            if unlabeled_policy == UnlabeledDataPolicy.KEEP:
+                unique_gesture_nums = {0}
+            else:
+                unique_gesture_nums = set()
+
             for kinematics_filename in os.listdir(dir_kinematics):
                 label_filepath = os.path.join(dir_labels, kinematics_filename)
                 if os.path.exists(label_filepath):
@@ -173,22 +179,37 @@ class KinematicsDataset(Dataset):
         self.scaler = None
         self.mode = mode
 
+        # Apply transform at initialization to avoid re-applying it in __getitem__
+        if self.transform:
+            if self.mode == KinematicsSamplingMode.SEQUENCE:
+                # self.data is a list of numpy arrays
+                self.data = [self.transform(torch.from_numpy(seq).float()) for seq in tqdm(self.data, desc="Applying transform to sequences")]
+            elif self.mode == KinematicsSamplingMode.SAMPLE:
+                # self.data is a single large numpy array
+                print("Applying transform to the entire dataset...")
+                self.data = self.transform(torch.from_numpy(self.data).float())
+                print("Transform applied.")
+
     def get_all_transformed_data(self):
         """
-        Applies the transform to the entire dataset and returns the result.
-        This is useful for fitting a scaler on the training data.
+        Returns all data as a single tensor.
+        If a transform was provided at init, the data is already transformed.
         """
-        if not self.transform:
-            raise RuntimeError("A transform must be provided to get transformed data.")
-
-        all_transformed_data = []
         if self.mode == KinematicsSamplingMode.SEQUENCE:
-            for seq in self.data:
-                transformed_seq = self.transform(torch.from_numpy(seq).float())
-                all_transformed_data.append(transformed_seq)
-            return torch.cat(all_transformed_data, dim=0)
+            # If data is already transformed, it's a list of tensors.
+            if self.data and isinstance(self.data[0], torch.Tensor):
+                return torch.cat(self.data, dim=0)
+            # Otherwise, it's a list of numpy arrays.
+            else:
+                all_data = [torch.from_numpy(seq).float() for seq in self.data]
+                return torch.cat(all_data, dim=0)
         elif self.mode == KinematicsSamplingMode.SAMPLE:
-            return self.transform(torch.from_numpy(self.data).float())
+            # If data is already transformed, it's a tensor.
+            if isinstance(self.data, torch.Tensor):
+                return self.data
+            # Otherwise, it's a numpy array.
+            else:
+                return torch.from_numpy(self.data).float()
 
     def fit_scaler(self, scaler: "BaseScaler"):
         """
@@ -224,27 +245,40 @@ class KinematicsDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
-        # Get the raw data sample
+        # Get the data sample. It's already a tensor if a transform was applied at init.
         data_sample = self.data[idx]
 
-        # Convert to tensor for transformation
-        # The transform function expects a tensor
-        data_tensor = torch.from_numpy(data_sample).float()
-
-        # Apply the transformation if it exists
-        if self.transform:
-            transformed_data = self.transform(data_tensor)
+        # If no transform was applied at init, data is still numpy. Convert to tensor.
+        if not isinstance(data_sample, torch.Tensor):
+            data_tensor = torch.from_numpy(data_sample).float()
         else:
-            transformed_data = data_tensor
+            data_tensor = data_sample
 
-        # Apply the scaler if it exists
+        # The transform has already been applied at init.
+        # We just need to apply the scaler if it exists.
         if self.scaler:
-            # The scaler expects a tensor, which transformed_data already is
-            scaled_data = self.scaler.transform(transformed_data)
+            # The scaler expects a tensor, which data_tensor is.
+            scaled_data = self.scaler.transform(data_tensor)
         else:
-            scaled_data = transformed_data
+            scaled_data = data_tensor
 
-        # Pair with the corresponding label
-        sample = (scaled_data, self.labels[idx])
+        # Pair with the corresponding label and convert label to tensor
+        label = self.labels[idx]
+        
+        # For classification, labels should be torch.long
+        # For one-hot, they'll be float. For raw, they remain as is (likely not for training).
+        if isinstance(label, (np.integer, int)):
+            label_tensor = torch.tensor(label, dtype=torch.long)
+        elif isinstance(label, np.ndarray):
+            if label.dtype.kind in {'U', 'S', 'O'}:
+                # Raw string labels as numpy array: convert to list of strings
+                label_tensor = label.tolist()
+            else:
+                label_tensor = torch.from_numpy(label).float()
+        else:
+            # Keep raw labels as they are (e.g., strings), not for training
+            label_tensor = label
+
+        sample = (scaled_data, label_tensor)
 
         return sample
