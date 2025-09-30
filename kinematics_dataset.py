@@ -6,11 +6,7 @@ import os
 import re
 from collections import defaultdict
 from enum import Enum
-from kinematics_sampling_mode import KinematicsSamplingMode
-from labels_format import LabelsFormat
-from users import Users
-from trials import Trials
-from unlabeled_data_policy import UnlabeledDataPolicy
+from options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
 from data_scalers.scalers import BaseScaler
 import torch
 
