@@ -274,11 +274,20 @@ class KinematicsDataset(Dataset):
                 # Raw string labels as numpy array: convert to list of strings
                 label_tensor = label.tolist()
             else:
-                label_tensor = torch.from_numpy(label).float()
+                # This handles integer and one-hot labels which are numpy arrays
+                if label.dtype.kind == 'i':
+                    label_tensor = torch.from_numpy(label).long()
+                else:
+                    label_tensor = torch.from_numpy(label).float()
         else:
             # Keep raw labels as they are (e.g., strings), not for training
             label_tensor = label
 
-        sample = (scaled_data, label_tensor)
+        if self.mode == KinematicsSamplingMode.SAMPLE:
+            # In SAMPLE mode, each item is a single sample, no need to output lenth
+            sample = (scaled_data, label_tensor)
+        elif self.mode == KinematicsSamplingMode.SEQUENCE:
+            # In SEQUENCE mode, each item is a full trial sequence
+            sample = (scaled_data, label_tensor, scaled_data.shape[0]) # Also return sequence length
 
         return sample

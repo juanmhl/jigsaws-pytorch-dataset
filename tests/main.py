@@ -3,6 +3,8 @@ from options import KinematicsSamplingMode, LabelsFormat, Users, Trials, Unlabel
 from transforms import extract_PSM_kinematics
 from data_scalers.scalers import MinMaxScaler
 import torch
+from torch.utils.data import DataLoader
+from collate_fns import collate_fn_seqs_with_padding
 
 def test_basic_dataset_creation():
     print("--- Testing Basic Dataset Creation ---")
@@ -26,6 +28,86 @@ def test_basic_dataset_creation():
     print(f"Labels for first sequence: {first_labels.shape}")
     print(type(first_labels))
     print("-" * 30)
+
+def test_dataloader_with_collate_fn():
+    """
+    Tests the DataLoader with the custom collate function for all label formats.
+    """
+    print("--- Testing DataLoader with Collate Function ---")
+    batch_size = 4
+
+    # Test case 1: ONE_HOT labels
+    print("\n--- Testing with ONE_HOT labels ---")
+    dataset_one_hot = KinematicsDataset(
+        dir="./dataset/Suturing/",
+        mode=KinematicsSamplingMode.SEQUENCE,
+        labels_format=LabelsFormat.ONE_HOT,
+        unlabeled_policy=UnlabeledDataPolicy.IGNORE,
+        transform=extract_PSM_kinematics,
+    )
+    dataloader_one_hot = DataLoader(
+        dataset_one_hot,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_seqs_with_padding
+    )
+    features, labels, lengths = next(iter(dataloader_one_hot))
+    print(f"Features batch shape: {features.shape}")
+    print(f"Labels batch shape: {labels.shape}")
+    print(f"Lengths batch: {lengths}")
+    print(f"Labels type: {labels.dtype}")
+    assert features.dim() == 3 and features.shape[0] == batch_size
+    assert labels.dim() == 3 and labels.shape[0] == batch_size # (batch, max_len, num_classes)
+    assert labels.dtype == torch.float
+
+    # Test case 2: INTEGER labels
+    print("\n--- Testing with INTEGER labels ---")
+    dataset_integer = KinematicsDataset(
+        dir="./dataset/Suturing/",
+        mode=KinematicsSamplingMode.SEQUENCE,
+        labels_format=LabelsFormat.INTEGER,
+        unlabeled_policy=UnlabeledDataPolicy.IGNORE,
+        transform=extract_PSM_kinematics,
+    )
+    dataloader_integer = DataLoader(
+        dataset_integer,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_seqs_with_padding
+    )
+    features, labels, lengths = next(iter(dataloader_integer))
+    print(f"Features batch shape: {features.shape}")
+    print(f"Labels batch shape: {labels.shape}")
+    print(f"Lengths batch: {lengths}")
+    print(f"Labels type: {labels.dtype}")
+    assert features.dim() == 3 and features.shape[0] == batch_size
+    assert labels.dim() == 2 and labels.shape[0] == batch_size # (batch, max_len)
+    assert labels.dtype == torch.long
+
+    # Test case 3: RAW labels
+    print("\n--- Testing with RAW labels ---")
+    dataset_raw = KinematicsDataset(
+        dir="./dataset/Suturing/",
+        mode=KinematicsSamplingMode.SEQUENCE,
+        labels_format=LabelsFormat.RAW,
+        unlabeled_policy=UnlabeledDataPolicy.IGNORE,
+        transform=extract_PSM_kinematics,
+    )
+    dataloader_raw = DataLoader(
+        dataset_raw,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=collate_fn_seqs_with_padding
+    )
+    features, labels, lengths = next(iter(dataloader_raw))
+    print(f"Features batch shape: {features.shape}")
+    print(f"Labels is a tuple of lists of strings. Length: {len(labels)}")
+    print(f"Lengths batch: {lengths}")
+    assert features.dim() == 3 and features.shape[0] == batch_size
+    assert isinstance(labels, tuple) and len(labels) == batch_size
+    assert isinstance(labels[0], list) and isinstance(labels[0][0], str)
+    
+    print("--- DataLoader Test Complete ---\n")
 
 def test_data_scaling():
     """
@@ -113,7 +195,8 @@ def test_data_scaling():
 
 def main():
     # test_basic_dataset_creation()
-    test_data_scaling()
+    # test_data_scaling()
+    test_dataloader_with_collate_fn()
 
 if __name__ == "__main__":
     main()
