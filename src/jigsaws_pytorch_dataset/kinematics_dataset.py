@@ -6,8 +6,8 @@ import os
 import re
 from collections import defaultdict
 from enum import Enum
-from options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
-from data_scalers.scalers import BaseScaler
+from .options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
+from .data_scalers.scalers import BaseScaler
 import torch
 from tqdm import tqdm
 

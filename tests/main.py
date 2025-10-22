@@ -1,10 +1,10 @@
-from kinematics_dataset import KinematicsDataset
-from options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
-from transforms import extract_PSM_kinematics
-from data_scalers.scalers import MinMaxScaler
 import torch
 from torch.utils.data import DataLoader
-from collate_fns import collate_fn_seqs_with_padding
+from jigsaws_pytorch_dataset import KinematicsDataset
+from jigsaws_pytorch_dataset.options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
+from jigsaws_pytorch_dataset.transforms import extract_PSM_kinematics
+from jigsaws_pytorch_dataset.data_scalers.scalers import MinMaxScaler
+from jigsaws_pytorch_dataset.collate_fns import collate_fn_seqs_with_padding
 
 def test_basic_dataset_creation():
     print("--- Testing Basic Dataset Creation ---")
