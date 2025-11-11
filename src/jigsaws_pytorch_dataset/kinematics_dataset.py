@@ -248,6 +248,9 @@ class KinematicsDataset(Dataset):
         # Get the data sample. It's already a tensor if a transform was applied at init.
         data_sample = self.data[idx]
 
+
+        #### DATA TRANSFORMATION AND SCALING ####
+
         # If no transform was applied at init, data is still numpy. Convert to tensor.
         if not isinstance(data_sample, torch.Tensor):
             data_tensor = torch.from_numpy(data_sample).float()
@@ -264,6 +267,9 @@ class KinematicsDataset(Dataset):
 
         # Pair with the corresponding label and convert label to tensor
         label = self.labels[idx]
+
+
+        #### LABEL FORMAT PROCESSING ####
         
         # For classification, labels should be torch.long
         # For one-hot, they'll be float. For raw, they remain as is (likely not for training).
@@ -282,6 +288,9 @@ class KinematicsDataset(Dataset):
         else:
             # Keep raw labels as they are (e.g., strings), not for training
             label_tensor = label
+
+
+        #### WHETHER TO RETURN LENGTH OR NOT ####
 
         if self.mode == KinematicsSamplingMode.SAMPLE:
             # In SAMPLE mode, each item is a single sample, no need to output lenth
