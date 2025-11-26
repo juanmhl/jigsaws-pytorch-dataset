@@ -19,7 +19,9 @@ class KinematicsDataset(Dataset):
                  unlabeled_policy: UnlabeledDataPolicy = UnlabeledDataPolicy.KEEP,
                  users_set: Tuple[Users] = (Users.B, Users.C, Users.D, Users.E, Users.F, Users.G, Users.H, Users.I),
                  trials_set: Tuple[Trials] = (Trials.T1, Trials.T2, Trials.T3, Trials.T4, Trials.T5),
-                 transform=None):
+                 transform=None,
+                 window_size: int = 32,
+                 stride: int = 1):
         """
         Initializes the JIGSAWS Kinematics Dataset.
 
@@ -32,6 +34,7 @@ class KinematicsDataset(Dataset):
                 Defaults to KinematicsSamplingMode.SEQUENCE.
                 - KinematicsSamplingMode.SEQUENCE: Each item in the dataset is a full trial sequence.
                 - KinematicsSamplingMode.SAMPLE: The dataset is flattened into individual samples across all trials.
+                - KinematicsSamplingMode.WINDOW: The dataset is sliced into overlapping windows.
             labels_format (LabelsFormat, optional): Defines the format of the output labels. 
                 Defaults to LabelsFormat.RAW.
                 - LabelsFormat.RAW: Labels are kept as strings (e.g., 'G1', 'G5').
@@ -47,6 +50,8 @@ class KinematicsDataset(Dataset):
                 Defaults to all trials for the selected users.
             transform (callable, optional): Optional transform to be applied on a sample. 
                 Applied in __getitem__.
+            window_size (int, optional): Size of the window for WINDOW mode. Defaults to 32.
+            stride (int, optional): Stride for the window for WINDOW mode. Defaults to 1.
         """
 
         dir_kinematics = os.path.join(dir, "kinematics", "AllGestures")
@@ -169,6 +174,15 @@ class KinematicsDataset(Dataset):
                         elif mode == KinematicsSamplingMode.SAMPLE:
                             self.data.extend(kin_trial_data)
                             self.labels.extend(label_trial_data)
+                        elif mode == KinematicsSamplingMode.WINDOW:
+                            T = kin_trial_data.shape[0]
+                            if T >= window_size:
+                                for start in range(0, T - window_size + 1, stride):
+                                    end = start + window_size
+                                    window_data = kin_trial_data[start:end]
+                                    window_label = label_trial_data[end - 1]
+                                    self.data.append(window_data)
+                                    self.labels.append(window_label)
         
         # Convert to numpy arrays for efficiency, especially for SAMPLE mode
         if mode == KinematicsSamplingMode.SAMPLE:
@@ -181,9 +195,9 @@ class KinematicsDataset(Dataset):
 
         # Apply transform at initialization to avoid re-applying it in __getitem__
         if self.transform:
-            if self.mode == KinematicsSamplingMode.SEQUENCE:
+            if self.mode == KinematicsSamplingMode.SEQUENCE or self.mode == KinematicsSamplingMode.WINDOW:
                 # self.data is a list of numpy arrays
-                self.data = [self.transform(torch.from_numpy(seq).float()) for seq in tqdm(self.data, desc="Applying transform to sequences")]
+                self.data = [self.transform(torch.from_numpy(seq).float()) for seq in tqdm(self.data, desc="Applying transform to sequences/windows")]
             elif self.mode == KinematicsSamplingMode.SAMPLE:
                 # self.data is a single large numpy array
                 print("Applying transform to the entire dataset...")
@@ -195,7 +209,7 @@ class KinematicsDataset(Dataset):
         Returns all data as a single tensor.
         If a transform was provided at init, the data is already transformed.
         """
-        if self.mode == KinematicsSamplingMode.SEQUENCE:
+        if self.mode == KinematicsSamplingMode.SEQUENCE or self.mode == KinematicsSamplingMode.WINDOW:
             # If data is already transformed, it's a list of tensors.
             if self.data and isinstance(self.data[0], torch.Tensor):
                 return torch.cat(self.data, dim=0)
@@ -292,7 +306,7 @@ class KinematicsDataset(Dataset):
 
         #### WHETHER TO RETURN LENGTH OR NOT ####
 
-        if self.mode == KinematicsSamplingMode.SAMPLE:
+        if self.mode == KinematicsSamplingMode.SAMPLE or self.mode == KinematicsSamplingMode.WINDOW:
             # In SAMPLE mode, each item is a single sample, no need to output lenth
             sample = (scaled_data, label_tensor)
         elif self.mode == KinematicsSamplingMode.SEQUENCE:
