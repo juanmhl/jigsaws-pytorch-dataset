@@ -1,15 +1,23 @@
-from typing import List, Tuple
-from torch.utils.data import Dataset
-import numpy as np
-import pandas as pd
 import os
 import re
 from collections import defaultdict
-from enum import Enum
-from .options import KinematicsSamplingMode, LabelsFormat, Users, Trials, UnlabeledDataPolicy
-from .data_scalers.scalers import BaseScaler
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
 import torch
+from torch.utils.data import Dataset
 from tqdm import tqdm
+
+from .data_scalers.scalers import BaseScaler
+from .options import (
+    KinematicsSamplingMode,
+    LabelsFormat,
+    Trials,
+    UnlabeledDataPolicy,
+    Users,
+)
+
 
 class KinematicsDataset(Dataset):
     def __init__(self, 
@@ -17,6 +25,7 @@ class KinematicsDataset(Dataset):
                  mode: KinematicsSamplingMode = KinematicsSamplingMode.SEQUENCE, 
                  labels_format: LabelsFormat = LabelsFormat.RAW, 
                  unlabeled_policy: UnlabeledDataPolicy = UnlabeledDataPolicy.KEEP,
+                 use_access_grouping: bool = False,
                  users_set: Tuple[Users] = (Users.B, Users.C, Users.D, Users.E, Users.F, Users.G, Users.H, Users.I),
                  trials_set: Tuple[Trials] = (Trials.T1, Trials.T2, Trials.T3, Trials.T4, Trials.T5),
                  transform=None,
@@ -44,6 +53,8 @@ class KinematicsDataset(Dataset):
                 Defaults to UnlabeledDataPolicy.KEEP.
                 - UnlabeledDataPolicy.KEEP: Unlabeled samples are kept and assigned the default label 'G0'.
                 - UnlabeledDataPolicy.IGNORE: Unlabeled samples are filtered out and discarded.
+            use_access_grouping (bool, optional): Whether to use access paper groups of gestures instead
+                of the original gesture labels. Can only be used with the Suturing subset. Defaults to False.
             users_set (Tuple[Users], optional): A tuple of `Users` enum members to include. 
                 Defaults to all users in the dataset.
             trials_set (Tuple[Trials], optional): A tuple of `Trials` enum members to include. 
@@ -62,6 +73,21 @@ class KinematicsDataset(Dataset):
 
         file_pattern = re.compile(r".*_([B-I])(\d{3})\.txt")
 
+        self.use_access_grouping = use_access_grouping
+
+        self.suturing_labels_conversion_map = {
+            'G1': 'Q0',
+            'G2': 'Q1',
+            'G3': 'Q2',
+            'G4': 'Q4',
+            'G5': 'Q0',
+            'G6': 'Q3',
+            'G8': 'Q1',
+            'G9': 'Q3',
+            'G10': 'Q3',
+            'G11': 'Q5'
+        }
+
         # Auto-detect gesture mapping for integer and one-hot encoding
         self.gesture_map = None
         num_classes = 0
@@ -78,7 +104,12 @@ class KinematicsDataset(Dataset):
                     try:
                         labels_df = pd.read_csv(label_filepath, sep=r'\s+', header=None, usecols=[2])
                         if not labels_df.empty:
-                            gest_nums_in_file = set(labels_df[2].str[1:].astype(int))
+                            # Map gestures to Access groups if enabled
+                            if self.use_access_grouping:
+                                gestures = labels_df[2].apply(lambda g: self.suturing_labels_conversion_map.get(g, g))
+                                gest_nums_in_file = set(gestures.str[1:].astype(int))
+                            else:
+                                gest_nums_in_file = set(labels_df[2].str[1:].astype(int))
                             unique_gesture_nums.update(gest_nums_in_file)
                     except pd.errors.EmptyDataError:
                         # Some label files might be empty, just skip them
@@ -91,8 +122,9 @@ class KinematicsDataset(Dataset):
             print("Gesture mapping enabled for INTEGER or ONE_HOT format:")
             print("Original Gesture -> Mapped Integer")
             # Sort map by original gesture number for clear printing
+            gesture_prefix = "Q" if self.use_access_grouping else "G"
             for original_gest, mapped_int in sorted(self.gesture_map.items()):
-                print(f"G{original_gest} -> {mapped_int}")
+                print(f"{gesture_prefix}{original_gest} -> {mapped_int}")
             print("-" * 30) # Separator for clarity
         
 
@@ -114,11 +146,14 @@ class KinematicsDataset(Dataset):
 
                     # Read and process labels data
                     num_samples = kinematics_trial_data.shape[0]
-                    labels = np.full(num_samples, 'G0', dtype='<U2') # Default label 'G0'
+                    labels = np.full(num_samples, 'G0', dtype='<U3')  # '<U3' for G10, G11 (3 chars)
 
                     labels_df = pd.read_csv(label_filepath, sep=r'\s+', header=None)
                     for _, row in labels_df.iterrows():
                         start, end, label = int(row[0]), int(row[1]), row[2]
+                        # Map to Access gesture group if enabled
+                        if self.use_access_grouping:
+                            label = self.suturing_labels_conversion_map.get(label, label)
                         labels[start-1:end] = label # Files are 1-indexed, numpy is 0-indexed
                     
                     # Handle unlabeled data policy
