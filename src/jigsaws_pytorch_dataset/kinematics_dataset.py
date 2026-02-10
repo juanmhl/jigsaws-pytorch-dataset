@@ -1,15 +1,17 @@
+"""JIGSAWS Kinematics Dataset for PyTorch."""
+
 import os
 import re
 from collections import defaultdict
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from tqdm import tqdm
 
-from .data_scalers.scalers import BaseScaler
+from .gesture_groupings import get_grouping
+from .label_encoder import LabelEncoder
 from .options import (
     KinematicsSamplingMode,
     LabelsFormat,
@@ -20,332 +22,234 @@ from .options import (
 
 
 class KinematicsDataset(Dataset):
-    def __init__(self, 
-                 dir: str, 
-                 mode: KinematicsSamplingMode = KinematicsSamplingMode.SEQUENCE, 
-                 labels_format: LabelsFormat = LabelsFormat.RAW, 
-                 unlabeled_policy: UnlabeledDataPolicy = UnlabeledDataPolicy.KEEP,
-                 use_access_grouping: bool = False,
-                 users_set: Tuple[Users] = (Users.B, Users.C, Users.D, Users.E, Users.F, Users.G, Users.H, Users.I),
-                 trials_set: Tuple[Trials] = (Trials.T1, Trials.T2, Trials.T3, Trials.T4, Trials.T5),
-                 transform=None,
-                 window_size: int = 32,
-                 stride: int = 1):
-        """
-        Initializes the JIGSAWS Kinematics Dataset.
+    """JIGSAWS Kinematics Dataset.
 
-        This class handles loading, processing, and structuring the JIGSAWS dataset
-        for use with PyTorch's DataLoader.
+    This class handles loading, processing, and structuring the JIGSAWS dataset
+    for use with PyTorch's DataLoader.
 
-        Args:
-            dir (str): The root directory of the JIGSAWS dataset subset (e.g., "dataset/Suturing/").
-            mode (KinematicsSamplingMode, optional): Defines how data is structured. 
-                Defaults to KinematicsSamplingMode.SEQUENCE.
-                - KinematicsSamplingMode.SEQUENCE: Each item in the dataset is a full trial sequence.
-                - KinematicsSamplingMode.SAMPLE: The dataset is flattened into individual samples across all trials.
-                - KinematicsSamplingMode.WINDOW: The dataset is sliced into overlapping windows.
-            labels_format (LabelsFormat, optional): Defines the format of the output labels. 
-                Defaults to LabelsFormat.RAW.
-                - LabelsFormat.RAW: Labels are kept as strings (e.g., 'G1', 'G5').
-                - LabelsFormat.INTEGER: Labels are mapped to a dense, 0-indexed integer range.
-                - LabelsFormat.ONE_HOT: Labels are one-hot encoded based on the unique gestures found.
-            unlabeled_policy (UnlabeledDataPolicy, optional): Defines how to handle unlabeled samples. 
-                Defaults to UnlabeledDataPolicy.KEEP.
-                - UnlabeledDataPolicy.KEEP: Unlabeled samples are kept and assigned the default label 'G0'.
-                - UnlabeledDataPolicy.IGNORE: Unlabeled samples are filtered out and discarded.
-            use_access_grouping (bool, optional): Whether to use access paper groups of gestures instead
-                of the original gesture labels. Can only be used with the Suturing subset. Defaults to False.
-            users_set (Tuple[Users], optional): A tuple of `Users` enum members to include. 
-                Defaults to all users in the dataset.
-            trials_set (Tuple[Trials], optional): A tuple of `Trials` enum members to include. 
-                Defaults to all trials for the selected users.
-            transform (callable, optional): Optional transform to be applied on a sample. 
-                Applied in __getitem__.
-            window_size (int, optional): Size of the window for WINDOW mode. Defaults to 32.
-            stride (int, optional): Stride for the window for WINDOW mode. Defaults to 1.
-        """
+    Args:
+        dir: Root directory of the JIGSAWS dataset subset (e.g., "dataset/Suturing/").
+        mode: How data is structured. Defaults to SEQUENCE.
+            - SEQUENCE: Each item is a full trial sequence
+            - SAMPLE: Dataset is flattened into individual samples
+        labels_format: Output label format. Defaults to RAW.
+            - RAW: String labels (e.g., 'G1', 'G5')
+            - INTEGER: Dense 0-indexed integers
+            - ONE_HOT: One-hot encoded vectors
+        unlabeled_policy: How to handle unlabeled samples. Defaults to KEEP.
+            - KEEP: Unlabeled samples are kept and assigned 'G0'
+            - IGNORE: Unlabeled samples are filtered out
+        gesture_grouping: Gesture grouping to use. Can be:
+            - str: Name of a predefined grouping (e.g., "access_suturing")
+            - dict: Custom mapping (e.g., {'G1': 'Q0', 'G2': 'Q1', ...})
+            - None: No grouping (default)
+        users_set: Tuple of Users to include. Defaults to all users.
+        trials_set: Tuple of Trials to include. Defaults to all trials.
+        transform: Optional transform applied lazily in __getitem__.
+        label_encoder: Optional pre-fitted LabelEncoder. If not provided,
+            one will be created and fitted automatically.
+
+    Example:
+        >>> dataset = KinematicsDataset(
+        ...     dir="./dataset/Suturing/",
+        ...     mode=KinematicsSamplingMode.SEQUENCE,
+        ...     labels_format=LabelsFormat.INTEGER,
+        ... )
+        >>> features, labels, length = dataset[0]
+    """
+
+    def __init__(
+        self,
+        dir: str,
+        mode: KinematicsSamplingMode = KinematicsSamplingMode.SEQUENCE,
+        labels_format: LabelsFormat = LabelsFormat.RAW,
+        unlabeled_policy: UnlabeledDataPolicy = UnlabeledDataPolicy.KEEP,
+        gesture_grouping: Optional[str | dict] = None,
+        users_set: Optional[Tuple[Users, ...]] = None,
+        trials_set: Optional[Tuple[Trials, ...]] = None,
+        transform: Optional[Callable] = None,
+        label_encoder: Optional[LabelEncoder] = None,
+    ):
+        if users_set is None:
+            users_set = (Users.B, Users.C, Users.D, Users.E, Users.F, Users.G, Users.H, Users.I)
+        if trials_set is None:
+            trials_set = (Trials.T1, Trials.T2, Trials.T3, Trials.T4, Trials.T5)
+
+        self.mode = mode
+        self.transform = transform
+        self.labels_format = labels_format
+
+        # Resolve gesture grouping
+        if isinstance(gesture_grouping, str):
+            self._gesture_grouping = get_grouping(gesture_grouping)
+        else:
+            self._gesture_grouping = gesture_grouping
 
         dir_kinematics = os.path.join(dir, "kinematics", "AllGestures")
         dir_labels = os.path.join(dir, "transcriptions")
 
-        self.kinematics_data = defaultdict(dict)
-        self.labels_data = defaultdict(dict)
-
         file_pattern = re.compile(r".*_([B-I])(\d{3})\.txt")
 
-        self.use_access_grouping = use_access_grouping
+        # Load raw data from files
+        kinematics_data = defaultdict(dict)
+        labels_data = defaultdict(dict)
+        raw_labels_for_fitting = []
 
-        self.suturing_labels_conversion_map = {
-            'G1': 'Q0',
-            'G2': 'Q1',
-            'G3': 'Q2',
-            'G4': 'Q4',
-            'G5': 'Q0',
-            'G6': 'Q3',
-            'G8': 'Q1',
-            'G9': 'Q3',
-            'G10': 'Q3',
-            'G11': 'Q5'
-        }
-
-        # Auto-detect gesture mapping for integer and one-hot encoding
-        self.gesture_map = None
-        num_classes = 0
-        if labels_format in [LabelsFormat.INTEGER, LabelsFormat.ONE_HOT]:
-            # If unlabeled data is ignored, G0 is not a valid label
-            if unlabeled_policy == UnlabeledDataPolicy.KEEP:
-                unique_gesture_nums = {0}
-            else:
-                unique_gesture_nums = set()
-
-            for kinematics_filename in os.listdir(dir_kinematics):
-                label_filepath = os.path.join(dir_labels, kinematics_filename)
-                if os.path.exists(label_filepath):
-                    try:
-                        labels_df = pd.read_csv(label_filepath, sep=r'\s+', header=None, usecols=[2])
-                        if not labels_df.empty:
-                            # Map gestures to Access groups if enabled
-                            if self.use_access_grouping:
-                                gestures = labels_df[2].apply(lambda g: self.suturing_labels_conversion_map.get(g, g))
-                                gest_nums_in_file = set(gestures.str[1:].astype(int))
-                            else:
-                                gest_nums_in_file = set(labels_df[2].str[1:].astype(int))
-                            unique_gesture_nums.update(gest_nums_in_file)
-                    except pd.errors.EmptyDataError:
-                        # Some label files might be empty, just skip them
-                        continue
-            
-            sorted_gestures = sorted(list(unique_gesture_nums))
-            self.gesture_map = {gest_num: i for i, gest_num in enumerate(sorted_gestures)}
-            num_classes = len(self.gesture_map)
-
-            print("Gesture mapping enabled for INTEGER or ONE_HOT format:")
-            print("Original Gesture -> Mapped Integer")
-            # Sort map by original gesture number for clear printing
-            gesture_prefix = "Q" if self.use_access_grouping else "G"
-            for original_gest, mapped_int in sorted(self.gesture_map.items()):
-                print(f"{gesture_prefix}{original_gest} -> {mapped_int}")
-            print("-" * 30) # Separator for clarity
-        
-
-        # Loading all the data into self.kinematics_data and self.labels_data,
-        # first as a dictionary of [user][trial] = np.array
         for kinematics_filename in os.listdir(dir_kinematics):
             label_filepath = os.path.join(dir_labels, kinematics_filename)
 
-            if os.path.exists(label_filepath):
-                match = file_pattern.match(kinematics_filename)
-                if match:
-                    user, trial_str = match.groups()
-                    trial = int(trial_str)
-                    
-                    kinematics_filepath = os.path.join(dir_kinematics, kinematics_filename)
-                    
-                    # Read kinematics data
-                    kinematics_trial_data = pd.read_csv(kinematics_filepath, sep=r'\s+', header=None).values
+            if not os.path.exists(label_filepath):
+                continue
 
-                    # Read and process labels data
-                    num_samples = kinematics_trial_data.shape[0]
-                    labels = np.full(num_samples, 'G0', dtype='<U3')  # '<U3' for G10, G11 (3 chars)
+            match = file_pattern.match(kinematics_filename)
+            if not match:
+                continue
 
-                    labels_df = pd.read_csv(label_filepath, sep=r'\s+', header=None)
-                    for _, row in labels_df.iterrows():
-                        start, end, label = int(row[0]), int(row[1]), row[2]
-                        # Map to Access gesture group if enabled
-                        if self.use_access_grouping:
-                            label = self.suturing_labels_conversion_map.get(label, label)
-                        labels[start-1:end] = label # Files are 1-indexed, numpy is 0-indexed
-                    
-                    # Handle unlabeled data policy
-                    if unlabeled_policy == UnlabeledDataPolicy.IGNORE:
-                        labeled_indices = np.where(labels != 'G0')[0]
-                        kinematics_trial_data = kinematics_trial_data[labeled_indices]
-                        labels = labels[labeled_indices]
+            user, trial_str = match.groups()
+            trial = int(trial_str)
 
-                    self.kinematics_data[user][trial] = kinematics_trial_data
+            kinematics_filepath = os.path.join(dir_kinematics, kinematics_filename)
 
-                    if labels_format == LabelsFormat.INTEGER:
-                        # Remove 'G', convert to int, and apply mapping
-                        labels = np.array([self.gesture_map[int(l[1:])] for l in labels])
-                    elif labels_format == LabelsFormat.ONE_HOT:
-                        # Remove 'G', convert to int, and apply mapping
-                        int_labels = np.array([self.gesture_map[int(l[1:])] for l in labels])
-                        # Then one-hot encode using auto-detected number of classes
-                        labels = np.eye(num_classes)[int_labels]
+            # Read kinematics data
+            kinematics_trial_data = pd.read_csv(
+                kinematics_filepath, sep=r'\s+', header=None
+            ).values
 
-                    self.labels_data[user][trial] = labels
-        
+            # Read and process labels
+            num_samples = kinematics_trial_data.shape[0]
+            labels = np.full(num_samples, 'G0', dtype='<U3')
 
+            labels_df = pd.read_csv(label_filepath, sep=r'\s+', header=None)
+            for _, row in labels_df.iterrows():
+                start, end, label = int(row[0]), int(row[1]), row[2]
+                if self._gesture_grouping:
+                    label = self._gesture_grouping.get(label, label)
+                labels[start-1:end] = label
 
-        ### Load only the specified users and trials into self.data and self.labels ###
+            # Handle unlabeled data policy
+            if unlabeled_policy == UnlabeledDataPolicy.IGNORE:
+                labeled_indices = np.where(labels != 'G0')[0]
+                kinematics_trial_data = kinematics_trial_data[labeled_indices]
+                labels = labels[labeled_indices]
 
+            kinematics_data[user][trial] = kinematics_trial_data
+            labels_data[user][trial] = labels
+            raw_labels_for_fitting.append(labels)
+
+        # Set up label encoder
+        if label_encoder is not None:
+            self._label_encoder = label_encoder
+        else:
+            self._label_encoder = LabelEncoder(
+                labels_format=labels_format,
+                gesture_grouping=self._gesture_grouping
+            )
+            include_unlabeled = unlabeled_policy == UnlabeledDataPolicy.KEEP
+            self._label_encoder.fit(raw_labels_for_fitting, include_unlabeled=include_unlabeled)
+
+        # Build dataset from selected users and trials
         self.data = []
         self.labels = []
-        
-        # Convert enums to their primitive values for key lookup
-        user_values = [u.value for u in users_set] if users_set else []
-        trial_values = [t.value for t in trials_set] if trials_set else []
 
-        # Use all users/trials if sets are not provided
-        if not user_values:
-            user_values = self.kinematics_data.keys()
-        if not trial_values:
-            # Flatten all trial numbers from all users into a single set
-            all_trials = set()
-            for user in user_values:
-                all_trials.update(self.kinematics_data.get(user, {}).keys())
-            trial_values = list(all_trials)
+        user_values = [u.value for u in users_set]
+        trial_values = [t.value for t in trials_set]
 
-        for user in sorted(list(user_values)):
-            if user in self.kinematics_data:
-                for trial in sorted(list(trial_values)):
-                    if trial in self.kinematics_data[user]:
-                        kin_trial_data = self.kinematics_data[user][trial]
-                        label_trial_data = self.labels_data[user][trial]
-                        
-                        if mode == KinematicsSamplingMode.SEQUENCE:
-                            self.data.append(kin_trial_data)
-                            self.labels.append(label_trial_data)
-                        elif mode == KinematicsSamplingMode.SAMPLE:
-                            self.data.extend(kin_trial_data)
-                            self.labels.extend(label_trial_data)
-                        elif mode == KinematicsSamplingMode.WINDOW:
-                            T = kin_trial_data.shape[0]
-                            if T >= window_size:
-                                for start in range(0, T - window_size + 1, stride):
-                                    end = start + window_size
-                                    window_data = kin_trial_data[start:end]
-                                    window_label = label_trial_data[end - 1]
-                                    self.data.append(window_data)
-                                    self.labels.append(window_label)
-        
-        # Convert to numpy arrays for efficiency, especially for SAMPLE mode
+        for user in sorted(user_values):
+            if user not in kinematics_data:
+                continue
+            for trial in sorted(trial_values):
+                if trial not in kinematics_data[user]:
+                    continue
+
+                kin_trial_data = kinematics_data[user][trial]
+                label_trial_data = labels_data[user][trial]
+
+                # Encode labels
+                encoded_labels = self._label_encoder.encode(label_trial_data)
+
+                if mode == KinematicsSamplingMode.SEQUENCE:
+                    self.data.append(kin_trial_data)
+                    self.labels.append(encoded_labels)
+                elif mode == KinematicsSamplingMode.SAMPLE:
+                    self.data.extend(kin_trial_data)
+                    self.labels.extend(encoded_labels)
+
+        # Convert to numpy arrays for SAMPLE mode
         if mode == KinematicsSamplingMode.SAMPLE:
             self.data = np.array(self.data)
             self.labels = np.array(self.labels)
 
-        self.transform = transform
-        self.scaler = None
-        self.mode = mode
-
-        # Apply transform at initialization to avoid re-applying it in __getitem__
-        if self.transform:
-            if self.mode == KinematicsSamplingMode.SEQUENCE or self.mode == KinematicsSamplingMode.WINDOW:
-                # self.data is a list of numpy arrays
-                self.data = [self.transform(torch.from_numpy(seq).float()) for seq in tqdm(self.data, desc="Applying transform to sequences/windows")]
-            elif self.mode == KinematicsSamplingMode.SAMPLE:
-                # self.data is a single large numpy array
-                print("Applying transform to the entire dataset...")
-                self.data = self.transform(torch.from_numpy(self.data).float())
-                print("Transform applied.")
-
-    def get_all_transformed_data(self):
-        """
-        Returns all data as a single tensor.
-        If a transform was provided at init, the data is already transformed.
-        """
-        if self.mode == KinematicsSamplingMode.SEQUENCE or self.mode == KinematicsSamplingMode.WINDOW:
-            # If data is already transformed, it's a list of tensors.
-            if self.data and isinstance(self.data[0], torch.Tensor):
-                return torch.cat(self.data, dim=0)
-            # Otherwise, it's a list of numpy arrays.
-            else:
-                all_data = [torch.from_numpy(seq).float() for seq in self.data]
-                return torch.cat(all_data, dim=0)
-        elif self.mode == KinematicsSamplingMode.SAMPLE:
-            # If data is already transformed, it's a tensor.
-            if isinstance(self.data, torch.Tensor):
-                return self.data
-            # Otherwise, it's a numpy array.
-            else:
-                return torch.from_numpy(self.data).float()
-
-    def fit_scaler(self, scaler: "BaseScaler"):
-        """
-        Fits the given scaler on the dataset's transformed data and assigns it.
-
-        Args:
-            scaler (BaseScaler): An instance of a scaler to be fitted.
-        
-        Returns:
-            BaseScaler: The fitted scaler.
-        """
-        if not self.transform:
-            raise RuntimeError("A transform must be provided to fit a scaler.")
-
-        print("Fitting scaler on the dataset's data...")
-        data_to_fit = self.get_all_transformed_data()
-        scaler.fit(data_to_fit)
-        self.scaler = scaler
-        print("Scaler fitted and assigned to the dataset.")
-        return scaler
-
-    def set_scaler(self, scaler: "BaseScaler"):
-        """
-        Assigns a pre-fitted scaler to the dataset.
-
-        Args:
-            scaler (BaseScaler): A pre-fitted scaler instance.
-        """
-        self.scaler = scaler
-        print("Pre-fitted scaler assigned to the dataset.")
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.data)
 
-    def __getitem__(self, idx):
-        # Get the data sample. It's already a tensor if a transform was applied at init.
+    def __getitem__(self, idx: int):
+        """Get a data sample.
+
+        Returns:
+            For SEQUENCE mode: (features, labels, length)
+            For SAMPLE mode: (features, label)
+        """
         data_sample = self.data[idx]
 
-
-        #### DATA TRANSFORMATION AND SCALING ####
-
-        # If no transform was applied at init, data is still numpy. Convert to tensor.
-        if not isinstance(data_sample, torch.Tensor):
-            data_tensor = torch.from_numpy(data_sample).float()
-        else:
+        # Convert to tensor
+        if isinstance(data_sample, torch.Tensor):
             data_tensor = data_sample
-
-        # The transform has already been applied at init.
-        # We just need to apply the scaler if it exists.
-        if self.scaler:
-            # The scaler expects a tensor, which data_tensor is.
-            scaled_data = self.scaler.transform(data_tensor)
         else:
-            scaled_data = data_tensor
+            data_tensor = torch.from_numpy(data_sample).float()
 
-        # Pair with the corresponding label and convert label to tensor
+        # Apply transform lazily
+        if self.transform is not None:
+            data_tensor = self.transform(data_tensor)
+
+        # Get label
         label = self.labels[idx]
+        label_out = self._convert_label(label)
 
+        if self.mode == KinematicsSamplingMode.SAMPLE:
+            return data_tensor, label_out
+        else:
+            return data_tensor, label_out, data_tensor.shape[0]
 
-        #### LABEL FORMAT PROCESSING ####
-        
-        # For classification, labels should be torch.long
-        # For one-hot, they'll be float. For raw, they remain as is (likely not for training).
+    def _convert_label(self, label):
+        """Convert label to appropriate tensor type."""
         if isinstance(label, (np.integer, int)):
-            label_tensor = torch.tensor(label, dtype=torch.long)
+            return torch.tensor(label, dtype=torch.long)
         elif isinstance(label, np.ndarray):
             if label.dtype.kind in {'U', 'S', 'O'}:
-                # Raw string labels as numpy array: convert to list of strings
-                label_tensor = label.tolist()
+                return label.tolist() if label.ndim > 0 else str(label)
+            elif label.dtype.kind == 'i':
+                return torch.from_numpy(label).long()
             else:
-                # This handles integer and one-hot labels which are numpy arrays
-                if label.dtype.kind == 'i':
-                    label_tensor = torch.from_numpy(label).long()
-                else:
-                    label_tensor = torch.from_numpy(label).float()
+                return torch.from_numpy(label).float()
+        elif isinstance(label, torch.Tensor):
+            return label
         else:
-            # Keep raw labels as they are (e.g., strings), not for training
-            label_tensor = label
+            return label
 
+    def get_label_encoder(self) -> LabelEncoder:
+        """Get the label encoder for decoding predictions."""
+        return self._label_encoder
 
-        #### WHETHER TO RETURN LENGTH OR NOT ####
+    @property
+    def num_classes(self) -> int:
+        """Number of gesture classes."""
+        return self._label_encoder.num_classes
 
-        if self.mode == KinematicsSamplingMode.SAMPLE or self.mode == KinematicsSamplingMode.WINDOW:
-            # In SAMPLE mode, each item is a single sample, no need to output lenth
-            sample = (scaled_data, label_tensor)
-        elif self.mode == KinematicsSamplingMode.SEQUENCE:
-            # In SEQUENCE mode, each item is a full trial sequence
-            sample = (scaled_data, label_tensor, scaled_data.shape[0]) # Also return sequence length
+    def get_all_data(self) -> torch.Tensor:
+        """Returns all data as a single tensor.
 
-        return sample
+        Useful for fitting scalers externally.
+        """
+        if self.mode == KinematicsSamplingMode.SEQUENCE:
+            tensors = []
+            for seq in self.data:
+                if isinstance(seq, torch.Tensor):
+                    tensors.append(seq)
+                else:
+                    tensors.append(torch.from_numpy(seq).float())
+            return torch.cat(tensors, dim=0)
+        else:
+            if isinstance(self.data, torch.Tensor):
+                return self.data
+            else:
+                return torch.from_numpy(self.data).float()
