@@ -63,28 +63,25 @@ test_dataset.set_scaler(scaler)
 **After:**
 ```python
 from jigsaws_pytorch_dataset import MinMaxScaler
+from jigsaws_pytorch_dataset.transforms import extract_PSM_kinematics
 
-# Fit scaler externally
+# Create dataset with feature extraction transform
+dataset = KinematicsDataset(..., transform=extract_PSM_kinematics)
+
+# Fit scaler on transformed data (get_all_data respects transforms)
 scaler = MinMaxScaler()
-train_data = train_dataset.get_all_data()
-scaler.fit(train_data)
+scaler.fit(dataset.get_all_data())  # fits on 24-feature data
+
+# Append scaler as a second transform — no re-instantiation needed
+dataset.add_transform(scaler.transform)
 
 # Save for later use
 scaler.save("scaler.pt")
-
-# Option A: Use transform
-def my_transform(x):
-    return scaler.transform(x)
-
-dataset = KinematicsDataset(..., transform=my_transform)
-
-# Option B: Apply after loading
-for features, labels in dataloader:
-    features = scaler.transform(features)
 ```
 
 **Benefits:**
-- Explicit control over scaling workflow
+- Composable transform pipeline with `add_transform()`
+- `get_all_data()` respects transforms, so scalers fit on the right data
 - Scaler persistence with save/load
 - Inverse transform for recovering original values
 
@@ -318,40 +315,31 @@ from jigsaws_pytorch_dataset import (
 )
 from jigsaws_pytorch_dataset.options import KinematicsSamplingMode, LabelsFormat
 
-# Fit scaler on training data first
+# Create training dataset with feature extraction transform
 train_base = KinematicsDataset(
     dir="./dataset/Suturing/",
     mode=KinematicsSamplingMode.SEQUENCE,
     labels_format=LabelsFormat.INTEGER,
     gesture_grouping="access_suturing",
+    transform=my_transform,
 )
 
+# Fit scaler on transformed training data (get_all_data respects transforms)
 scaler = MinMaxScaler()
 scaler.fit(train_base.get_all_data())
 scaler.save("scaler.pt")  # Persist for later
 
-# Create transform that includes scaling
-def transform(x):
-    x = my_transform(x)
-    return scaler.transform(x)
-
-# Training dataset
-train_base = KinematicsDataset(
-    dir="./dataset/Suturing/",
-    mode=KinematicsSamplingMode.SEQUENCE,
-    labels_format=LabelsFormat.INTEGER,
-    gesture_grouping="access_suturing",
-    transform=transform,
-)
+# Append scaler to the existing transform pipeline — no re-instantiation
+train_base.add_transform(scaler.transform)
 train_dataset = WindowedDataset(train_base, window_size=32, stride=1)
 
-# Test dataset (share label encoder!)
+# Test dataset (share label encoder, same transform pipeline)
 test_base = KinematicsDataset(
     dir="./dataset/Suturing/",
     mode=KinematicsSamplingMode.SEQUENCE,
     labels_format=LabelsFormat.INTEGER,
     gesture_grouping="access_suturing",
-    transform=transform,
+    transform=[my_transform, scaler.transform],  # Pass list of transforms
     label_encoder=train_base.get_label_encoder(),  # Share encoder
 )
 test_dataset = WindowedDataset(test_base, window_size=32, stride=1)

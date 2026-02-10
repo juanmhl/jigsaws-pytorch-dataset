@@ -3,7 +3,7 @@
 import os
 import re
 from collections import defaultdict
-from typing import Callable, Optional, Tuple
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -45,7 +45,8 @@ class KinematicsDataset(Dataset):
             - None: No grouping (default)
         users_set: Tuple of Users to include. Defaults to all users.
         trials_set: Tuple of Trials to include. Defaults to all trials.
-        transform: Optional transform applied lazily in __getitem__.
+        transform: Optional transform(s) applied lazily in __getitem__.
+            Can be a single callable, a list/tuple of callables, or None.
         label_encoder: Optional pre-fitted LabelEncoder. If not provided,
             one will be created and fitted automatically.
 
@@ -67,7 +68,7 @@ class KinematicsDataset(Dataset):
         gesture_grouping: Optional[str | dict] = None,
         users_set: Optional[Tuple[Users, ...]] = None,
         trials_set: Optional[Tuple[Trials, ...]] = None,
-        transform: Optional[Callable] = None,
+        transform: Optional[Union[Callable, Sequence[Callable]]] = None,
         label_encoder: Optional[LabelEncoder] = None,
     ):
         if users_set is None:
@@ -76,8 +77,15 @@ class KinematicsDataset(Dataset):
             trials_set = (Trials.T1, Trials.T2, Trials.T3, Trials.T4, Trials.T5)
 
         self.mode = mode
-        self.transform = transform
         self.labels_format = labels_format
+
+        # Store transforms as a list
+        if transform is None:
+            self._transforms: list[Callable] = []
+        elif isinstance(transform, (list, tuple)):
+            self._transforms = list(transform)
+        else:
+            self._transforms = [transform]
 
         # Resolve gesture grouping
         if isinstance(gesture_grouping, str):
@@ -197,9 +205,8 @@ class KinematicsDataset(Dataset):
         else:
             data_tensor = torch.from_numpy(data_sample).float()
 
-        # Apply transform lazily
-        if self.transform is not None:
-            data_tensor = self.transform(data_tensor)
+        # Apply transforms lazily
+        data_tensor = self._apply_transforms(data_tensor)
 
         # Get label
         label = self.labels[idx]
@@ -226,6 +233,20 @@ class KinematicsDataset(Dataset):
         else:
             return label
 
+    def _apply_transforms(self, data: torch.Tensor) -> torch.Tensor:
+        for t in self._transforms:
+            data = t(data)
+        return data
+
+    def add_transform(self, transform: Callable) -> None:
+        """Append a transform to the pipeline."""
+        self._transforms.append(transform)
+
+    @property
+    def transform(self) -> list[Callable]:
+        """The list of transforms applied to data."""
+        return self._transforms
+
     def get_label_encoder(self) -> LabelEncoder:
         """Get the label encoder for decoding predictions."""
         return self._label_encoder
@@ -236,20 +257,22 @@ class KinematicsDataset(Dataset):
         return self._label_encoder.num_classes
 
     def get_all_data(self) -> torch.Tensor:
-        """Returns all data as a single tensor.
+        """Returns all data as a single tensor with transforms applied.
 
-        Useful for fitting scalers externally.
+        Useful for fitting scalers on transformed data.
         """
         if self.mode == KinematicsSamplingMode.SEQUENCE:
             tensors = []
             for seq in self.data:
                 if isinstance(seq, torch.Tensor):
-                    tensors.append(seq)
+                    t = seq
                 else:
-                    tensors.append(torch.from_numpy(seq).float())
+                    t = torch.from_numpy(seq).float()
+                tensors.append(self._apply_transforms(t))
             return torch.cat(tensors, dim=0)
         else:
             if isinstance(self.data, torch.Tensor):
-                return self.data
+                all_data = self.data
             else:
-                return torch.from_numpy(self.data).float()
+                all_data = torch.from_numpy(self.data).float()
+            return self._apply_transforms(all_data)
